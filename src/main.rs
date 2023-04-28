@@ -1,11 +1,10 @@
 #[macro_use]
 extern crate rocket;
 
-use std::io::Write;
+use std::io::{Cursor, Write};
 
-use image_convert::{to_gif, to_jpg, to_png, GIFConfig, ImageResource, JPGConfig, PNGConfig};
 use rocket::form::Form;
-use rocket::fs::{relative, FileServer, TempFile};
+use rocket::fs::TempFile;
 use rocket::futures::future::join_all;
 use rocket::http::{ContentType, Header};
 use rocket::response::status::{self, BadRequest};
@@ -17,13 +16,18 @@ use zip::write::FileOptions;
 #[launch]
 fn rocket() -> _ {
     rocket::build()
-        .mount("/", FileServer::from(relative!("static")))
+        .mount("/", routes![index])
         .mount("/upload", routes![upload])
 }
 
+#[get("/")]
+async fn index() -> (ContentType, &'static str) {
+    (ContentType::HTML, include_str!("../static/index.html"))
+}
+
 #[post("/", data = "<file>")]
-async fn upload(
-    file: Form<Upload<'_>>,
+async fn upload<'a>(
+    mut file: Form<Upload<'a>>,
 ) -> Result<(ContentType, ContentDisposition<Vec<u8>>), BadRequest<&'static str>> {
     let format = Format::try_from(file.format.as_str());
     let format = match format {
@@ -34,33 +38,41 @@ async fn upload(
     let zip_buf = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(zip_buf);
 
-    let mut handlers: Vec<(JoinHandle<ImageResource>, _)> = Vec::new();
+    let mut handlers: Vec<(JoinHandle<Vec<u8>>, _)> = Vec::new();
 
-    for i in &file.images {
-        let input = ImageResource::from_path(i.path().unwrap());
-        let mut output = ImageResource::with_capacity(10000);
+    for i in &mut file.images {
+        let filebuf = rocket::tokio::fs::read(i.path().unwrap()).await.unwrap();
+        let guessed_format = image::guess_format(filebuf.as_ref()).unwrap();
+        let input = image::load_from_memory_with_format(filebuf.as_ref(), guessed_format).unwrap();
+        let mut output = Cursor::new(vec![]);
 
         let (handle, filename) = match format {
             Format::PNG => {
                 let handle = spawn_blocking(move || {
-                    to_png(&mut output, &input, &PNGConfig::default()).unwrap();
-                    output
+                    input
+                        .write_to(&mut output, image::ImageOutputFormat::Png)
+                        .unwrap();
+                    output.into_inner()
                 });
                 let filename = format!("{}.png", i.name().unwrap());
                 (handle, filename)
             }
             Format::JPEG => {
                 let handle = spawn_blocking(move || {
-                    to_jpg(&mut output, &input, &JPGConfig::default()).unwrap();
-                    output
+                    input
+                        .write_to(&mut output, image::ImageOutputFormat::Jpeg(100))
+                        .unwrap();
+                    output.into_inner()
                 });
                 let filename = format!("{}.jpeg", i.name().unwrap());
                 (handle, filename)
             }
             Format::GIF => {
                 let handle = spawn_blocking(move || {
-                    to_gif(&mut output, &input, &GIFConfig::default()).unwrap();
-                    output
+                    input
+                        .write_to(&mut output, image::ImageOutputFormat::Gif)
+                        .unwrap();
+                    output.into_inner()
                 });
                 let filename = format!("{}.gif", i.name().unwrap());
                 (handle, filename)
@@ -78,13 +90,12 @@ async fn upload(
 
     for (handle, filename) in handlers {
         let image_bytes = handle.unwrap();
-        let image_bytes = image_bytes.as_u8_slice().unwrap();
         zip.start_file(
             filename,
             FileOptions::default().compression_method(zip::CompressionMethod::DEFLATE),
         )
         .unwrap();
-        zip.write_all(image_bytes).unwrap();
+        zip.write_all(image_bytes.as_ref()).unwrap();
     }
 
     let zip_buf = zip.finish().unwrap();
